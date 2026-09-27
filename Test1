@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+黑洞 × Neon Hearts
+--------------------------------------------------------------
+运行效果：
+  · 屏幕中心是一个"黑黄写实美化版"黑洞：纯黑的视界 + 金黄色吸积环，
+    外环以肉眼看着不快不慢的速度绕中心旋转
+  · 第 3 秒开始播放音乐《Neon Hearts》
+      - 优先读取脚本同目录 / 当前目录 / assets 下的音频文件
+      - 找不到就用 numpy 现场合成一段电子风的备用音轨
+  · 流星雨从右上方向左下方高速掠过，颜色为粉色 / 金黄色 / 紫色，
+    从头到尾有亮度渐变的拖尾
+  · 第 45 秒画面淡出并退出
+
+依赖：
+    pip install pygame
+    pip install numpy   （可选，仅在缺少音乐文件时用来合成备用音轨）
+
+把 "Neon Hearts.mp3"（或 .wav / .ogg）放到脚本旁边即可播放原曲。
+"""
+
+import math
+import os
+import random
+import sys
+import time
+
+import pygame
+
+# ---------------------------------------------------------------------------
+# 全局参数
+# ---------------------------------------------------------------------------
+W, H = 1000, 700                 # 窗口尺寸
+FPS = 60
+DURATION = 150.0                  # 总时长（秒）
+MUSIC_DELAY = 3.0                # 第 3 秒开始播放音乐
+
+BG_COLOR = (4, 5, 14)            # 深空底色
+CX, CY = W // 2, H // 2          # 黑洞中心
+R_HORIZON = 62                   # 事件视界半径
+
+GOLD = (255, 196, 74)            # 金黄色
+GOLD_LIGHT = (255, 228, 150)
+
+METEOR_COLORS = [
+    (255, 105, 180),             # 粉色
+    (255, 200, 70),              # 金黄色
+    (176, 96, 255),              # 紫色
+]
+
+
+def clamp255(v):
+    if v < 0:
+        return 0
+    if v > 255:
+        return 255
+    return int(v)
+
+
+# ---------------------------------------------------------------------------
+# 绘制工具
+# ---------------------------------------------------------------------------
+def draw_radial_glow(surf, cx, cy, radius, color, power=2.4, steps=64):
+    """用同心圆叠出一团柔和的径向辉光（画到加成混合层上）。"""
+    for i in range(steps, 0, -1):
+        f = (1.0 - i / steps) ** power
+        if f <= 0.003:
+            continue
+        r = radius * i / steps
+        col = (clamp255(color[0] * f),
+               clamp255(color[1] * f),
+               clamp255(color[2] * f))
+        pygame.draw.circle(surf, col, (int(cx), int(cy)), int(r))
+
+
+def draw_ring(surf, cx, cy, r_in, r_out, squash, rot, color,
+              lobes=2, segments=140, brightness=1.0, base=0.22):
+    """
+    画一个椭圆的吸积环。通过沿角度方向做亮度调制并让调制相位随 rot 前进，
+    就能看到环在"转"。squash 是纵向压扁比例（模拟倾斜视角）。
+    """
+    for i in range(segments):
+        a0 = 2.0 * math.pi * i / segments
+        a1 = 2.0 * math.pi * (i + 1) / segments
+        mid = 0.5 * (a0 + a1)
+
+        m = 0.5 + 0.5 * math.cos(lobes * mid - rot)
+        f = (base + (1.0 - base) * m * m) * brightness
+
+        col = (clamp255(color[0] * f),
+               clamp255(color[1] * f),
+               clamp255(color[2] * f))
+
+        p1 = (cx + r_out * math.cos(a0), cy + r_out * squash * math.sin(a0))
+        p2 = (cx + r_out * math.cos(a1), cy + r_out * squash * math.sin(a1))
+        p3 = (cx + r_in * math.cos(a1), cy + r_in * squash * math.sin(a1))
+        p4 = (cx + r_in * math.cos(a0), cy + r_in * squash * math.sin(a0))
+        pygame.draw.polygon(surf, col, (p1, p2, p3, p4))
+
+
+def draw_glow_ring(surf, cx, cy, r, half_width, color, scale=1.0):
+    """画一圈发亮的光子环（细圆环 + 内外渐变）。"""
+    for d in range(-half_width, half_width + 1):
+        f = 1.0 - abs(d) / (half_width + 1.0)
+        b = (f ** 2) * scale
+        col = (clamp255(color[0] * b),
+               clamp255(color[1] * b),
+               clamp255(color[2] * b))
+        pygame.draw.circle(surf, col, (cx, cy), int(r + d), 2)
+
+
+def make_stars(count=230):
+    stars = []
+    for _ in range(count):
+        x = random.uniform(0, W)
+        y = random.uniform(0, H)
+        b = random.uniform(0.25, 1.0) ** 2
+        ph = random.uniform(0.0, math.tau)
+        stars.append((x, y, b, ph))
+    return stars
+
+
+def draw_stars(screen, stars, t):
+    for (x, y, b, ph) in stars:
+        tw = 0.55 + 0.45 * math.sin(t * 1.6 + ph)
+        v = int(b * tw * 200)
+        if v <= 4:
+            continue
+        c = (v, v, min(255, int(v * 1.12)))
+        pygame.draw.circle(screen, c, (int(x), int(y)), 1)
+
+
+# ---------------------------------------------------------------------------
+# 流星
+# ---------------------------------------------------------------------------
+class Meteor:
+    """从右上方向左下方飞逝的流星，带渐变拖尾。"""
+
+    def __init__(self, spread=True):
+        self.spawn()
+        self.x = 0
+        self.y = 0
+        self.speed = 0
+        self.length = 0
+        if spread:
+            # 开场时让它们散落在轨迹上，避免一开始空荡荡
+            d = random.uniform(0.0, 1100.0)
+            self.x += self.dx * d
+            self.y += self.dy * d
+
+    def spawn(self):
+        # 出生点：上边缘右半部分，或右边缘上半部分
+        if random.random() < 0.62:
+            self.x = random.uniform(W * 0.30, W * 1.10)
+            self.y = random.uniform(-H * 0.30, H * 0.02)
+        else:
+            self.x = random.uniform(W * 0.92, W * 1.10)
+            self.y = random.uniform(-H * 0.05, H * 0.60)
+
+        # 方向：向左下方（屏幕坐标下 dx<0, dy>0）
+        ang = math.radians(random.uniform(118.0, 148.0))
+        self.dx = math.cos(ang)
+        self.dy = math.sin(ang)
+
+        self.speed = random.uniform(950.0, 1750.0)      # 像素/秒
+        self.length = random.uniform(130.0, 300.0)      # 拖尾长度
+        self.color = random.choice(METEOR_COLORS)
+        self.thickness = random.uniform(1.6, 3.2)
+
+    def update(self, dt):
+        self.x += self.dx * self.speed * dt
+        self.y += self.dy * self.speed * dt
+        if self.x < -self.length - 200 or self.y > H + 200:
+            self.spawn()
+
+    def render(self, surf):
+        n = 22
+        hx, hy = self.x, self.y
+        tx = hx - self.dx * self.length
+        ty = hy - self.dy * self.length
+
+        # 从尾部画到头部，让头部叠在最上面
+        for i in range(n - 1, -1, -1):
+            f = i / (n - 1.0)                 # 0 = 头, 1 = 尾
+            px = hx + (tx - hx) * f
+            py = hy + (ty - hy) * f
+            b = (1.0 - f) ** 1.7              # 越靠尾越暗
+            r = max(1, int(round(self.thickness * (1.0 - f) + 0.8)))
+            col = (clamp255(self.color[0] * b),
+                   clamp255(self.color[1] * b),
+                   clamp255(self.color[2] * b))
+            pygame.draw.circle(surf, col, (int(px), int(py)), r)
+
+
+# ---------------------------------------------------------------------------
+# 音乐
+# ---------------------------------------------------------------------------
+def build_fallback_track(sr=44100, dur=42.0):
+    """没有音乐文件时，用 numpy 现场合成一段电子风音轨。"""
+    import numpy as np
+
+    n = int(sr * dur)
+    buf = np.zeros(n, dtype=np.float32)
+
+    def add(start, length, freq, amp, wave="saw", decay=4.0):
+        i0 = int(start * sr)
+        if i0 < 0 or i0 >= n:
+            return
+        nn = min(int(length * sr), n - i0)
+        if nn <= 0:
+            return
+        t = np.arange(nn, dtype=np.float32) / sr
+        if wave == "saw":
+            x = 2.0 * ((freq * t) % 1.0) - 1.0
+        elif wave == "sine":
+            x = np.sin(2.0 * np.pi * freq * t)
+        elif wave == "square":
+            x = np.sign(np.sin(2.0 * np.pi * freq * t)) * 0.6
+        else:
+            x = np.sin(2.0 * np.pi * freq * t)
+        env = np.exp(-decay * t) * np.minimum(t / 0.006, 1.0)
+        buf[i0:i0 + nn] += (x * env * amp).astype(np.float32)
+
+    def kick(start, amp=0.9):
+        i0 = int(start * sr)
+        if i0 < 0 or i0 >= n:
+            return
+        nn = min(int(0.28 * sr), n - i0)
+        t = np.arange(nn, dtype=np.float32) / sr
+        f = 130.0 * np.exp(-t * 22.0) + 42.0
+        x = np.sin(2.0 * np.pi * f * t)
+        env = np.exp(-t * 9.0) * np.minimum(t / 0.004, 1.0)
+        buf[i0:i0 + nn] += (x * env * amp).astype(np.float32)
+
+    def hat(start, amp=0.13):
+        i0 = int(start * sr)
+        if i0 < 0 or i0 >= n:
+            return
+        nn = min(int(0.06 * sr), n - i0)
+        t = np.arange(nn, dtype=np.float32) / sr
+        x = np.random.uniform(-1.0, 1.0, nn).astype(np.float32)
+        env = np.exp(-t * 90.0)
+        buf[i0:i0 + nn] += (x * env * amp).astype(np.float32)
+
+    # Am - F - C - G 循环
+    chords = [
+        (110.00, [220.00, 261.63, 329.63, 440.00]),
+        (87.31,  [174.61, 220.00, 261.63, 349.23]),
+        (130.81, [261.63, 329.63, 392.00, 523.25]),
+        (98.00,  [196.00, 246.94, 293.66, 392.00]),
+    ]
+    pattern = [0, 1, 2, 3, 2, 3, 1, 2]
+    step = 0.25          # 八分音符
+    bar = step * 8       # 每个和弦 2 秒
+
+    t_cur = 0.0
+    idx = 0
+    while t_cur < dur:
+        root, notes = chords[idx % len(chords)]
+
+        # 低音
+        add(t_cur, 0.9, root / 2.0, 0.30, "sine", decay=2.2)
+        add(t_cur + bar / 2, 0.9, root / 2.0, 0.24, "sine", decay=2.2)
+
+        # 铺底和弦
+        for note in notes[:3]:
+            add(t_cur, bar, note, 0.055, "saw", decay=0.6)
+
+        # 琶音
+        for s in range(8):
+            note = notes[pattern[s]]
+            add(t_cur + s * step, step * 1.6, note, 0.14, "saw", decay=6.0)
+            add(t_cur + s * step, step * 0.9, note * 2.0, 0.05, "sine", decay=8.0)
+
+        # 鼓组
+        for b in range(4):
+            kick(t_cur + b * step * 2, 0.85 if b % 2 == 0 else 0.55)
+        for s in range(8):
+            hat(t_cur + s * step, 0.13 if s % 2 else 0.09)
+
+        t_cur += bar
+        idx += 1
+
+    peak = float(np.max(np.abs(buf)))
+    if peak > 0:
+        buf *= (0.92 / peak)
+
+    stereo = np.stack([buf, buf], axis=1)
+    data = np.ascontiguousarray((stereo * 32767.0).astype(np.int16))
+    return pygame.sndarray.make_sound(data)
+
+
+def start_music():
+    """优先播放音频文件，找不到就播放合成音轨。"""
+    if pygame.mixer.get_init() is None:
+        print("[音乐] 未检测到可用音频设备，跳过播放。")
+        return
+
+    candidates = [
+        "Neon Hearts.mp3", "Neon Hearts.wav", "Neon Hearts.ogg",
+        "Neon Hearts.flac", "Neon Hearts.m4a",
+        "Neon_Hearts.mp3", "neon_hearts.mp3", "NeonHearts.mp3",
+    ]
+    search_dirs = [
+        os.path.dirname(os.path.abspath(__file__)),
+        os.getcwd(),
+        os.path.join(os.getcwd(), "assets"),
+    ]
+
+    for d in search_dirs:
+        for name in candidates:
+            path = os.path.join(d, name)
+            if os.path.isfile(path):
+                try:
+                    pygame.mixer.music.load(path)
+                    pygame.mixer.music.set_volume(0.85)
+                    pygame.mixer.music.play()
+                    print(f"[音乐] 正在播放：{path}")
+                    return
+                except Exception as exc:
+                    print(f"[音乐] 加载失败 {path}: {exc}")
+
+    print("[音乐] 未找到 'Neon Hearts' 音频文件，改用内置合成音轨。")
+    try:
+        snd = build_fallback_track()
+        snd.set_volume(0.8)
+        snd.play()
+    except Exception as exc:
+        print(f"[音乐] 合成音轨失败（需要 numpy）：{exc}")
+
+
+# ---------------------------------------------------------------------------
+# 主程序
+# ---------------------------------------------------------------------------
+def main():
+    pygame.mixer.pre_init(44100, -16, 2, 512)
+    pygame.init()
+
+    screen = pygame.display.set_mode((W, H))
+    pygame.display.set_caption("Black Hole  ✦  Neon Hearts")
+    pygame.mouse.set_visible(False)
+    clock = pygame.time.Clock()
+
+    # 两层"加成混合"画布：glow 在黑洞后面，glow2 在黑洞前面
+    glow = pygame.Surface((W, H))
+    glow2 = pygame.Surface((W, H))
+
+    stars = make_stars()
+    meteors = [Meteor() for _ in range(20)]
+
+    t0 = time.perf_counter()
+    music_started = False
+    running = True
+
+    while running:
+        dt = clock.tick(FPS) / 1000.0
+        dt = min(dt, 0.05)
+
+        elapsed = time.perf_counter() - t0
+        if elapsed >= DURATION:
+            break
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
+                running = False
+        if not running:
+            break
+
+        # ---- 第 3 秒：开始播放音乐 ----
+        if not music_started and elapsed >= MUSIC_DELAY:
+            start_music()
+            music_started = True
+
+        t = elapsed
+        fade = min(1.0, t / 1.2)     # 开场 1.2 秒淡入
+
+        # ---- 背景 ----
+        screen.fill(BG_COLOR)
+        draw_stars(screen, stars, t)
+
+        # ---- 加成层 1：黑洞辉光 + 吸积环 ----
+        glow.fill((0, 0, 0))
+        draw_radial_glow(glow, CX, CY, 320, (30, 22, 8), power=2.6, steps=64)
+        draw_radial_glow(glow, CX, CY, 175, (48, 33, 10), power=2.2, steps=48)
+
+        rot_in = t * 1.90            # 内环转速
+        rot_out = t * 0.85           # 外环转速（更慢一些）
+
+        # 内圈：靠里的金色吸积环
+        draw_ring(glow, CX, CY, 80, 114, 0.38, rot_in, GOLD,
+                  lobes=3, segments=140, brightness=0.95 * fade)
+        # 外圈：金黄色的外环，绕中心旋转
+        draw_ring(glow, CX, CY, 124, 180, 0.38, rot_out, GOLD_LIGHT,
+                  lobes=2, segments=140, brightness=0.80 * fade)
+
+        screen.blit(glow, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+
+        # ---- 事件视界：纯黑的球体剪影 ----
+        pygame.draw.circle(screen, (0, 0, 0), (CX, CY), R_HORIZON)
+
+        # ---- 加成层 2：光子环 + 流星雨 ----
+        glow2.fill((0, 0, 0))
+
+        draw_glow_ring(glow2, CX, CY, R_HORIZON + 3, 9,
+                       (255, 205, 110), scale=fade)
+
+        for m in meteors:
+            m.update(dt)
+            m.render(glow2)
+
+        screen.blit(glow2, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+
+        pygame.display.flip()
+
+    # ---- 收尾淡出 ----
+    if pygame.mixer.get_init() is not None:
+        try:
+            pygame.mixer.music.fadeout(1200)
+        except Exception:
+            pass
+        try:
+            pygame.mixer.fadeout(1200)
+        except Exception:
+            pass
+
+    fade_surf = pygame.Surface((W, H))
+    fade_surf.fill((0, 0, 0))
+    for i in range(1, 26):
+        clock.tick(60)
+        fade_surf.set_alpha(int(255 * i / 25))
+        screen.blit(fade_surf, (0, 0))
+        pygame.display.flip()
+
+    pygame.quit()
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
